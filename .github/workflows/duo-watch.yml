@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       test_notification:
-        description: "Send a test push instead of checking (to confirm phones are subscribed)"
+        description: "Send a test push to each watch's topic instead of checking"
         type: boolean
         default: false
 
 permissions:
-  contents: write # lets the job save state.json so you only get pinged on changes
+  contents: write # lets the job save state files so alerts only fire on changes
 
 concurrency:
   group: duo-watch
@@ -25,20 +25,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Check availability
+      # Friend's watch: Night Sky 256GB within 50 miles of 95831.
+      - name: Sacramento watch
+        if: ${{ !cancelled() }}
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SEND_TEST: ${{ inputs.test_notification }}
+          WATCH_AREA: Sacramento
+          WATCH_ZIP: "95831"
+          WATCH_RADIUS_MILES: "50"
+          WATCH_PART_NUMBERS: MK1F4LL/A
+          STATE_FILE: state-sacramento.json
+        run: python3 watch.py
+
+      # Tony's watch: 256GB in either color at six specific stores.
+      # R075 Union Square, R217 Chestnut Street, R057 Bay Street (Emeryville),
+      # R414 4th Street (Berkeley), R014 Broadway Plaza (Walnut Creek), R101 Stoneridge Mall (Pleasanton)
+      - name: Oakland/SF watch
+        if: ${{ !cancelled() }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC_OAKLAND }}
+          SEND_TEST: ${{ inputs.test_notification }}
+          WATCH_AREA: Oakland/SF
+          WATCH_ZIP: "94612"
+          WATCH_RADIUS_MILES: "40"
+          WATCH_STORAGE_GB: "256"
+          WATCH_PART_NUMBERS: MK1F4LL/A,MK1E4LL/A
+          WATCH_STORE_IDS: R075,R217,R057,R414,R014,R101
+          STATE_FILE: state-oakland.json
         run: python3 watch.py
 
       - name: Save state if it changed
+        if: ${{ !cancelled() }}
         run: |
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
+          if [[ -n "$(git status --porcelain -- 'state-*.json')" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add state.json
+            git add -- 'state-*.json'
             git commit -m "Update availability state"
             git push
           fi

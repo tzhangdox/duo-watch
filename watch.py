@@ -3,6 +3,16 @@
 
 Read-only: one GET to the Duo Stock API per run. It never touches Apple's site
 and never buys or reserves anything. Standard library only, no installs needed.
+
+Configured with environment variables (see the workflow file):
+  WATCH_AREA           Name used in alerts, e.g. "Sacramento"
+  WATCH_ZIP            ZIP code to search around
+  WATCH_RADIUS_MILES   Straight-line radius from the ZIP's center
+  WATCH_PART_NUMBERS   Comma-separated Apple part numbers to watch
+  WATCH_STORAGE_GB     Optional size filter sent to the tracker (e.g. 256)
+  WATCH_STORE_IDS      Optional comma-separated store IDs; empty = any store in the radius
+  NTFY_TOPIC           ntfy topic that receives the alerts
+  STATE_FILE           Where this watch remembers what it has already alerted on
 """
 import json
 import os
@@ -13,11 +23,18 @@ import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+
+def env_list(name, default=""):
+    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+
+
 API_URL = "https://duo-checker.on-forge.com/api/v1/nearby"
 ZIP = os.environ.get("WATCH_ZIP", "95831")
-PART_NUMBER = os.environ.get("WATCH_PART_NUMBER", "MK1F4LL/A")  # iPhone Duo, Night Sky, 256GB
-VARIANT = os.environ.get("WATCH_VARIANT_LABEL", "iPhone Duo Night Sky 256GB")
+AREA = os.environ.get("WATCH_AREA", ZIP)
 RADIUS_MILES = os.environ.get("WATCH_RADIUS_MILES", "50")
+PART_NUMBERS = set(env_list("WATCH_PART_NUMBERS", "MK1F4LL/A"))  # default: Night Sky 256GB
+STORAGE_GB = os.environ.get("WATCH_STORAGE_GB", "").strip()
+STORE_IDS = set(env_list("WATCH_STORE_IDS"))
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -28,17 +45,16 @@ TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
 def fetch_nearby():
     """Return the tracker's /nearby response, or None if it's temporarily unavailable."""
-    query = urllib.parse.urlencode({
-        "zip": ZIP,
-        "part_number": PART_NUMBER,
-        "radius_miles": RADIUS_MILES,
-        "available_only": 1,
-    })
+    params = {"zip": ZIP, "radius_miles": RADIUS_MILES, "available_only": 1, "limit": 50}
+    if len(PART_NUMBERS) == 1:
+        params["part_number"] = next(iter(PART_NUMBERS))
+    elif STORAGE_GB:
+        params["storage_gb"] = STORAGE_GB
     request = urllib.request.Request(
-        f"{API_URL}?{query}",
+        f"{API_URL}?{urllib.parse.urlencode(params)}",
         headers={
             "Accept": "application/json",
-            "User-Agent": "duo-watch/1.0 (personal watcher, one request per 20 min)",
+            "User-Agent": "duo-watch/1.1 (personal watcher, one request per 20 min)",
         },
     )
     try:
@@ -55,16 +71,28 @@ def fetch_nearby():
         return None
 
 
-def available_stores(data):
-    """Map store_id -> details for every store showing the watched part as available."""
+def variant_label(product):
+    color, storage = product.get("color"), product.get("storage_label")
+    if color and storage:
+        return f"{color} {storage}"
+    return product.get("part_number", "unknown variant")
+
+
+def available_listings(data):
+    """Map "store_id:part_number" -> details for every watched store/variant showing available."""
     found = {}
     for store in data.get("stores") or []:
+        store_id = store.get("store_id")
+        if not store_id or (STORE_IDS and store_id not in STORE_IDS):
+            continue
         for product in store.get("products") or []:
-            if product.get("part_number") == PART_NUMBER and product.get("pickup_status") == "available":
-                found[store["store_id"]] = {
-                    "name": store.get("name") or store["store_id"],
+            part = product.get("part_number")
+            if part in PART_NUMBERS and product.get("pickup_status") == "available":
+                found[f"{store_id}:{part}"] = {
+                    "name": store.get("name") or store_id,
                     "city": store.get("city") or "",
                     "distance_miles": store.get("distance_miles"),
+                    "variant": variant_label(product),
                     "message": product.get("pickup_message") or "Available",
                     "url": store.get("url") or store.get("page_url") or "",
                 }
@@ -74,14 +102,14 @@ def available_stores(data):
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return set(json.load(f).get("available_store_ids", []))
+            return set(json.load(f).get("available", []))
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
 
-def save_state(store_ids):
+def save_state(keys):
     with open(STATE_FILE, "w") as f:
-        json.dump({"available_store_ids": sorted(store_ids)}, f, indent=2)
+        json.dump({"available": sorted(keys)}, f, indent=2)
         f.write("\n")
 
 
@@ -95,7 +123,7 @@ def pacific_time(iso_timestamp):
 def notify(title, body, click_url=""):
     topic = os.environ.get("NTFY_TOPIC", "").strip()
     if not topic:
-        sys.exit("NTFY_TOPIC is not set. Add it as a repository secret.")
+        sys.exit("NTFY_TOPIC is not set for this watch. Add the repository secret it uses.")
     headers = {"Title": title, "Priority": "high", "Tags": "iphone"}
     if click_url:
         headers["Click"] = click_url
@@ -116,10 +144,10 @@ def distance_label(miles):
 def main():
     if os.environ.get("SEND_TEST", "").lower() == "true":
         notify(
-            "Duo watch test",
-            f"Test from the {VARIANT} watcher for {ZIP}. If you can read this, alerts will reach this phone.",
+            f"Duo watch test ({AREA})",
+            f"Test from the iPhone Duo watcher for {AREA}. If you can read this, alerts will reach this phone.",
         )
-        print("Sent a test notification.")
+        print(f"Sent a test notification for {AREA}.")
         return
 
     data = fetch_nearby()
@@ -127,34 +155,36 @@ def main():
         return
 
     checked = pacific_time(data.get("run_finished_at"))
-    now_available = available_stores(data)
+    now_available = available_listings(data)
     previous = load_state()
-    newly_available = {sid: s for sid, s in now_available.items() if sid not in previous}
+    newly_available = {key: item for key, item in now_available.items() if key not in previous}
 
     if newly_available:
-        stores = sorted(
+        items = sorted(
             newly_available.values(),
             key=lambda s: s["distance_miles"] if isinstance(s["distance_miles"], (int, float)) else float("inf"),
         )
+        variants = sorted({item["variant"] for item in items})
         lines = [
-            f"• Apple {s['name']} ({s['city']}) — {distance_label(s['distance_miles'])} — {s['message']}"
-            for s in stores
+            f"• Apple {s['name']} ({s['city']}) — {s['variant']} — {distance_label(s['distance_miles'])} — {s['message']}"
+            for s in items
         ]
         body = (
-            f"{VARIANT} is showing available for pickup:\n"
+            "iPhone Duo is showing available for pickup:\n"
             + "\n".join(lines)
-            + f"\n\nTracker checked at {checked}. Confirm on apple.com before heading over; "
-            "this is an unofficial tracker, not a stock count."
+            + f"\n\nTracker checked at {checked}. Order on apple.com or in the Apple Store app and "
+            "choose in-store pickup. This is an unofficial tracker, not a stock count."
         )
         if data.get("is_stale"):
             body += "\nHeads up: the tracker marked this data as stale."
         # Alert first, save state after, so a failed push gets retried next run.
-        notify(f"{VARIANT} available near {ZIP}", body, click_url=stores[0]["url"])
-        print(f"ALERT SENT: {len(newly_available)} newly available store(s).\n{body}")
+        notify(f"iPhone Duo {' / '.join(variants)} available near {AREA}", body, click_url=items[0]["url"])
+        print(f"ALERT SENT ({AREA}): {len(newly_available)} newly available listing(s).\n{body}")
     elif now_available:
-        print(f"Still available at {len(now_available)} store(s) already alerted on (checked {checked}).")
+        print(f"{AREA}: still available at {len(now_available)} listing(s) already alerted on (checked {checked}).")
     else:
-        print(f"Nothing available within {RADIUS_MILES} mi of {ZIP} (checked {checked}).")
+        where = f"at the {len(STORE_IDS)} watched stores" if STORE_IDS else f"within {RADIUS_MILES} mi of {ZIP}"
+        print(f"{AREA}: nothing available {where} (checked {checked}).")
 
     if set(now_available) != previous:
         save_state(now_available.keys())
